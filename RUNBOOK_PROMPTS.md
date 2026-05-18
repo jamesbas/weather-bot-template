@@ -13,9 +13,18 @@ This is a **literal sequence of prompts** to paste into your OpenClaw chat (Tele
 1. **Finish §3 through §7 of `SETUP_GUIDE.md`** first (install OpenClaw, connect Telegram, Gmail, optionally Facebook). You need a working OpenClaw chat session before any of these prompts will work.
 2. Open a chat with your OpenClaw bot (Telegram DM is what we use).
 3. Send **Prompt 0** to verify the bot is alive.
-4. Walk through prompts **1 → 12** in order.
+4. Walk through prompts **1 → 16** in order.
 5. After each one, OpenClaw will create files, write code, or schedule cron jobs. Read what it did. Push back if anything's wrong.
 6. Where prompts say "TEST IT", actually run the test before moving on.
+
+**Important scheduling note (read before prompt 5):** approval
+checkers and email pollers should run as **systemd user timers**, not
+OpenClaw cron jobs. OpenClaw cron `agentTurn` hard-codes
+`tools.exec.security` to allowlist, which generates a Telegram
+approval prompt for every script call. systemd avoids that. The
+prompts below say "as a systemd timer" for checkers and "as an
+OpenClaw cron" for LLM-driven generators — that split matters. See
+`SETUP_GUIDE.md` §13.1 for the unit-file template.
 
 ---
 
@@ -159,16 +168,27 @@ under weather-agent/scripts/:
 4. publish_approved_daily_forecast.py --approval-id <id> — posts the
    approved draft to Facebook, sends a success/failure notification.
 
-Then add four cron jobs (isolated sessions, America/New_York timezone,
-default model, payload kind=agentTurn):
+Then add five jobs (use America/New_York timezone) split across
+schedulers per `SETUP_GUIDE.md` §13.1:
 
-- "Daily Forecast Morning Generator" at 06:30 daily
-- "Daily Forecast Morning Approval Request" at 06:40 daily
-- "Daily Forecast Afternoon Generator" at 15:00 daily
-- "Daily Forecast Afternoon Approval Request" at 15:10 daily
-- "Daily Forecast Approval Checker" every 15 minutes
+**OpenClaw cron** (isolated session, default model, payload
+kind=agentTurn, payload.toolsAllow=["exec","read"]):
+- "Daily Forecast Morning Generator + Approval Request" at 06:30 daily
+- "Daily Forecast Afternoon Generator + Approval Request" at 15:00 daily
 
-Show me the cron list when done.
+(Each cron's message runs `daily_forecast.py --phase <morning|afternoon>`
+*then* `request_daily_forecast_approval.py --latest` in one shell
+invocation, so we don't spawn the approval-request as its own LLM
+turn.)
+
+**systemd user timer** (cadence every 15 min, install per
+`SETUP_GUIDE.md` §13.1 template):
+- `weather-daily-forecast-approval-checker.timer` running
+  `check_daily_forecast_approval.py --send-notifications --verbose`
+  (the script itself self-gates to 06:30–18:00 local time).
+
+Show me the OpenClaw cron list AND `systemctl --user list-timers
+'weather-*'` when done.
 ```
 
 **TEST IT:**
@@ -195,9 +215,11 @@ Build the Severe Weather bot. Create:
 3. check_severe_weather_approval.py [--send-notifications]
 4. publish_approved_severe_weather.py --approval-id <id>
 
-Cron jobs:
-- "Severe Weather SPC Checker" at 10:00, 13:00, 16:00, 19:00 daily
-- "Severe Weather Approval Checker" every 15 minutes
+Cron / timer split:
+- **OpenClaw cron** (LLM-driven, toolsAllow=["exec","read"]):
+  "Severe Weather SPC Checker" at 10:00, 13:00, 16:00, 19:00 daily.
+- **systemd timer**: `weather-severe-weather-approval-checker.timer`
+  every 15 min.
 
 Hard rule in the prompt for the LLM: never use words like "outbreak",
 "historic", "catastrophic", or "life-threatening" unless those words
@@ -224,9 +246,11 @@ Create:
 4. publish_approved_alert_explainer.py --approval-id <id>
 5. generate_alert_map.py — draws affected counties on a basemap.
 
-Cron jobs:
-- "Alert Explainer Runner" every 15 minutes
-- "Alert Explainer Approval Checker" every 15 minutes
+Cron / timer split:
+- **OpenClaw cron** (LLM-driven, toolsAllow=["exec","read","write"]):
+  "Alert Explainer Runner" every 15 min.
+- **systemd timer**:
+  `weather-alert-explainer-approval-checker.timer` every 15 min.
 
 Always include a closer in every warning post: "Have multiple ways to
 receive warnings — NOAA Weather Radio, Wireless Emergency Alerts, and
@@ -247,9 +271,10 @@ Build the Storm Reports bot for post-event recaps. Create:
 3. check_storm_reports_approval.py [--send-notifications]
 4. publish_approved_storm_reports.py --approval-id <id>
 
-Cron jobs:
-- "Storm Reports Generator" at 22:00 daily
-- "Storm Reports Approval Checker" every 15 minutes
+Cron / timer split:
+- **OpenClaw cron**: "Storm Reports Generator" at 22:00 daily.
+- **systemd timer**: `weather-storm-reports-approval-checker.timer`
+  every 15 min.
 ```
 
 ---
@@ -266,9 +291,12 @@ codes: «AMZ###,AMZ###»). Create:
 3. check_marinecast_approval.py [--send-notifications]
 4. publish_approved_marinecast.py --approval-id <id>
 
-Cron jobs:
-- "MarineCast Daily Generator" at 05:00 daily
-- "MarineCast Approval Checker" every 15 minutes
+Cron / timer split:
+- **OpenClaw cron**: "MarineCast Daily Generator + Approval Request"
+  at 05:00 daily (the generator and request-approval run in one shell
+  invocation).
+- **systemd timer**: `weather-marinecast-approval-checker.timer`
+  every 15 min.
 ```
 
 If your region has no coastline, tell OpenClaw: *"Skip the MarineCast
@@ -289,11 +317,13 @@ guidance. Create:
 3. check_growcast_approval.py [--send-notifications]
 4. publish_approved_growcast.py --approval-id <id>
 
-Cron jobs (only run April through October):
-- "GrowCast Daily Generator" at 07:00 daily, months 4-10
-- "GrowCast Approval Request" at 07:15 daily, months 4-10
-- "GrowCast Weekly Private Briefing" at 08:00 every Sunday
-- "GrowCast Approval Checker" every 15 minutes
+Cron / timer split:
+- **OpenClaw cron** (only run April through October):
+  - "GrowCast Daily Generator + Approval Request" at 07:00 daily,
+    months 4-10.
+  - "GrowCast Weekly Private Briefing" at 08:00 every Sunday.
+- **systemd timer**: `weather-growcast-approval-checker.timer`
+  every 15 min.
 ```
 
 ---
@@ -338,29 +368,234 @@ Create:
 2. send_sounding_email_response.py --request <json> --analysis <md>
    — emails the analysis back to the original sender.
 
-Cron job:
-- "Sounding Email Analyst Watcher" every 10 minutes, isolated session,
-  with toolsAllow=["exec","read","write","image"], and a prompt that
-  says: for each REQUEST_JSON line, read the JSON, analyze each image
-  using the model-sounding-severe-analyst skill (or equivalent prompt),
-  write analysis.md, and call send_sounding_email_response.py.
+Cron job (read-gated split per `SETUP_GUIDE.md` §13.10):
+- **systemd timer**: `weather-sounding-email-poll.timer` every 10 min
+  runs `poll_sounding_email_requests.py`, writing
+  `state/sounding_pending.json`.
+- **OpenClaw cron**: "Sounding Email Analyst Watcher" every 15 minutes,
+  isolated session, with toolsAllow=["exec","read","write","image"], and
+  a prompt that says: read `state/sounding_pending.json`; if
+  `count==0` reply `STILL_NOTHING_TO_DO` and exit; otherwise for each
+  pending request analyze each image using the
+  model-sounding-severe-analyst skill (or equivalent prompt), write
+  analysis.md, and call send_sounding_email_response.py.
   Hard rule: never publish, never Telegram, never edit code.
 ```
 
 ---
 
-## Prompt 13 — Final wiring and verification
+## Prompt 13 — Add the LLM writer + deterministic safety net
+
+```
+For every public bot we built (daily_forecast, severe_weather,
+alert_explainer, storm_reports, marinecast, growcast public draft) and
+for the forecaster_briefing, add an LLM writer module with a
+deterministic safety-net fallback per SETUP_GUIDE.md §13.3.
+
+For each bot:
+
+1. Create src/weather/<bot>_writer.py with:
+   - A dataclass exposing model=None (defer to gateway default).
+   - build_prompt(source_bundle) -> str.
+   - write_post(source_bundle, fallback_callable) -> (text, llm_used,
+     fallback_reason). Calls `openclaw capability model run --prompt
+     <file> --gateway --json`. Falls back to the deterministic
+     generator on any subprocess error, timeout, non-OK envelope, or
+     empty outputs[0].text.
+
+2. Wire the writer into the bot's generator script. Save
+   <bot>_llm_prompt.txt and <bot>_llm_meta.json next to the normal
+   output. Add a --no-llm CLI flag that forces deterministic mode.
+
+3. Add scripts/test_<bot>_writer.py covering: prompt-contents check,
+   success path, subprocess-error fallback, non-OK-envelope fallback.
+   Use an injectable cli_runner so the LLM call is mocked.
+
+4. For the forecaster_briefing prompt: no emojis, no hashtags, no
+   sign-off; allow technical shorthand (CAPE/SRH/PWAT/LCL); explicit
+   rule to say "unavailable from current source data" rather than
+   invent values; 120s timeout. For public bots: target word count,
+   one allowed header emoji, hashtag whitelist, brand sign-off,
+   standard public closer, 90s timeout.
+
+5. Hard prompt rules across all bots: no fabrication of CAPE / shear /
+   lapse rates / rainfall / dewpoints / frost dates / soil temps /
+   hazard categories; no softening of NWS/SPC wording; SPC
+   categorical labels (Marginal/Slight/Enhanced/Moderate/High/PDS)
+   reproduced verbatim.
+
+Run all writer smoke tests when done and show me the results.
+```
+
+**TEST IT:** Generate one post each way and diff:
+```
+Run daily_forecast.py once with --no-llm (deterministic) and once
+without (LLM). Show me a diff of the two final_post outputs.
+```
+
+---
+
+## Prompt 14 — Add the approval-request idempotency guard
+
+```
+Add the idempotency guard from SETUP_GUIDE.md §13.4 to every
+--request-approval code path.
+
+1. Create src/weather/approval_idempotency.py with
+   find_existing_pending_approval(store, forecast_date, dry_run=False)
+   matching the helper in the setup guide.
+
+2. In every request_*_approval.py and any inline-request path
+   (e.g. marinecast.py --request-approval), call the guard right
+   before store.create_approval(...). On hit: print
+   REUSED_EXISTING_APPROVAL_ID=<id>, print STATUS=<status>, and exit
+   0 without creating a duplicate or sending Telegram + email
+   notifications.
+
+3. Add a test that runs --request-approval twice for the same date
+   and verifies the second call reuses the first approval ID and
+   sends no notifications.
+
+4. Also update the publisher dedup: save LLM writer output to
+   <basename>_llm.md (not <basename>.md) so a same-day re-post never
+   collides with the publisher's mark_post_attempt path-based guard
+   per §13.5.
+
+Run the new tests when done.
+```
+
+---
+
+## Prompt 15 — (Optional) Add the second publish target: your own website
+
+Skip this prompt if you don't have a website to publish to.
+
+```
+Add a second publish target alongside Facebook per SETUP_GUIDE.md
+§13.6.
+
+1. Create src/weather/website_client.py exposing WebsiteClient,
+   excerpt_from_markdown, record_website_result,
+   already_posted_to_website. POSTs to WEBSITE_BASE_URL +
+   /api/openclaw/publish with HMAC-SHA256 auth (X-USWW-Api-Key,
+   X-USWW-Timestamp, X-USWW-Signature: sha256=<hex>) over
+   timestamp + "." + rawBody. Honors WEBSITE_DISABLED=1 kill switch.
+
+2. Create scripts/publish_to_website_<bot>.py for each in-scope bot
+   (daily_forecast, marinecast, growcast public draft only,
+   severe_weather, alert_explainer). Storm Reports, sounding
+   analyst, forecaster briefing, chase target advisor, and the
+   GrowCast private weekly briefing are OUT OF SCOPE — do not wire
+   website publishers for those.
+
+3. Modify each check_<bot>_approval.py to call
+   publish_to_website_<bot>.py AFTER the Facebook publish, inside a
+   try/except that does NOT block the Facebook publish on failure.
+   Use the local idempotency guard (skip if approval record's
+   website_status == "posted"). Server should also dedupe on
+   approvalId as backstop.
+
+4. Approval records gain: website_status
+   (posted/post_failed/disabled), website_post_id,
+   website_public_url, website_published_at, website_error,
+   website_status_code.
+
+5. Add a test that simulates a website failure and verifies the
+   Facebook publish status is unaffected.
+
+Run the new tests when done.
+```
+
+---
+
+## Prompt 16 — (Optional) Per-customer paid workflow: Event Weather Advisor
+
+Skip this prompt if you're not running a paid customer offering.
+
+```
+Build the Event Weather Advisor per SETUP_GUIDE.md §13.7 — a
+per-event weather advisory for paying customers (outdoor weddings,
+concerts, festivals, sports).
+
+Create under weather-agent/scripts/:
+
+1. event_weather_intake.py — register a customer event (event_id
+   prefix ewa_, datetime, lat/lon, venue, customer contact, internal
+   notes). Persist to state/event_weather_requests.json.
+
+2. event_weather_prepare_update.py --event-id ewa_<id> —
+   deterministic Python that pulls NWS active alerts + daily/hourly
+   forecast for the event point, AFD context, SPC categorical risk
+   (only when event ≤ 3 days out), WPC excessive rainfall, and
+   climatology (NOAA normals + 30-yr historical analog + CPC monthly
+   outlooks) for far-out events. Computes a risk summary (Overall +
+   Rain / Thunderstorm / Severe / Wind / Heat / Cold / Flooding /
+   Setup-Teardown). Writes source_bundle_*.json, risk_summary_*.json,
+   and an LLM prompt packet event_weather_llm_prompt_*.md under
+   output/event_weather/<event_id>/. Tags the bundle with
+   data_strategy = climate_only when event > NWS forecast window.
+
+3. event_weather_send_email.py --event-id ewa_<id>
+   [--send-internal | --send-customer]
+   --internal-review-file <path> --message-file <path> —
+   operator-gated email send. Internal review goes to
+   EVENT_WEATHER_INTERNAL_RECIPIENTS; customer email goes to the
+   registered customer contact only. NEVER auto-sends.
+
+4. event_weather_due_updates.py — (optional, no LLM) prints which
+   events are due for a refresh based on their cadence and the
+   timestamp of their last update. Use this from a systemd timer if
+   you want a recurring reminder loop.
+
+5. event_weather_status.py — readonly inspector.
+
+Hard rules for the LLM prompt (encode in
+prompts/event_weather_llm_generation_instructions.md):
+- Dual-output document separated by the literal marker
+  <<<CUSTOMER_UPDATE_BELOW>>>.
+- NEVER recommend cancellation, postponement, or evacuation unless
+  risk.overall == High OR an active severe/flood warning is in the
+  source bundle alerts.
+- NEVER fabricate forecast values; say "unavailable from current
+  source data" instead.
+- NEVER present climatology as a forecast. Use "historically," "on
+  average," "the CPC monthly outlook leans toward."
+- If data_strategy == climate_only, state that plainly in the
+  customer email; confidence stays Low.
+- Customer email closes with a line directing the customer to monitor
+  official NWS warnings independently, then the brand sign-off.
+- NEVER posts to Facebook or the website.
+
+No cron job for this bot — it is operator-driven. Optionally install
+event_weather_due_updates.py as a systemd timer that just logs
+"events due" without sending anything.
+```
+
+---
+
+## Prompt 17 — Final wiring and verification
 
 ```
 Now do a full audit of what we built. Show me:
 
 1. The output of: openclaw config get tools.exec
    (must be ask=off, security=full)
-2. The full cron list with names, schedules, and timezones.
-   Confirm no checker runs more frequently than every 15 minutes.
-3. The contents of ~/.openclaw/workspace/weather-agent/.env.example
-4. A tree of weather-agent/ to depth 2.
-5. A summary of every approval-ID prefix in use and which bot owns it.
+2. The full OpenClaw cron list with names, schedules, and timezones.
+   Confirm: every approval-checker is a systemd timer, NOT an OpenClaw
+   cron. Every OpenClaw cron agentTurn payload has an explicit
+   toolsAllow list.
+3. `systemctl --user list-timers 'weather-*'` showing every approval
+   checker + email poller as a systemd timer.
+4. The contents of ~/.openclaw/workspace/weather-agent/.env.example
+5. A tree of weather-agent/ to depth 2.
+6. A summary of every approval-ID prefix in use and which bot owns it.
+7. For each public bot: confirm <bot>_writer.py exists, a smoke test
+   exists, and approval_idempotency.py is called from the matching
+   request_*_approval.py.
+8. If website publishing is wired: confirm publish_to_website_<bot>.py
+   exists ONLY for in-scope bots (daily_forecast, marinecast, growcast
+   public, severe_weather, alert_explainer) and NOT for the
+   out-of-scope ones.
 
 Then propose three things you would tighten or improve before going
 to production. Wait for my go-ahead before changing anything.
@@ -368,7 +603,7 @@ to production. Wait for my go-ahead before changing anything.
 
 ---
 
-## Prompt 14 — Daily ops tips
+## Prompt 18 — Daily ops tips
 
 Copy these and use whenever you need them:
 
@@ -407,14 +642,25 @@ and ~/.openclaw/logs/. Tell me what happened.
 
 ## What good looks like
 
-After all 14 prompts, you should have:
+After all 18 prompts, you should have:
 
-- ✅ ~20 cron jobs, all on 15-minute or longer cadences
-- ✅ One approval router hook handling 7 ID prefixes
-- ✅ A `weather-agent/` Python project with one venv, ~25–30 scripts, and a clean tests/ directory
-- ✅ Telegram + email + (optional) Facebook all wired
-- ✅ Nothing posts publicly without an `APPROVE <id>` from your verified Telegram ID
+- ✅ ~6–8 OpenClaw cron jobs (LLM-driven generators + private briefings
+  only), each with an explicit `toolsAllow` list on its agentTurn
+  payload
+- ✅ ~7–9 systemd user timers (approval checkers, email pollers,
+  mailbox cleanup), enabled with linger so they survive logout
+- ✅ One approval router hook handling 7+ ID prefixes (`dfa_`, `sva_`,
+  `mca_`, `gca_`, `sra_`, `aea_`, `asa_`, `ewa_` if you built the
+  Event Weather Advisor)
+- ✅ A `weather-agent/` Python project with one venv, ~30–40 scripts,
+  per-bot `<bot>_writer.py` modules with deterministic fallbacks, a
+  shared `approval_idempotency.py` guard, and a clean tests/ directory
+- ✅ Telegram + email + (optional) Facebook + (optional) website all
+  wired
+- ✅ Nothing posts publicly without an `APPROVE <id>` from your
+  verified Telegram ID
 
-If something's missing or broken, **ask OpenClaw to fix it conversationally** — that's the whole point of building it this way.
+If something's missing or broken, **ask OpenClaw to fix it
+conversationally** — that's the whole point of building it this way.
 
 Stay safe. ⛈️

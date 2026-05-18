@@ -196,21 +196,37 @@ To turn approvals into real Facebook posts, add the publisher and approval-route
 
 ## 7. Schedule it daily
 
-Tell OpenClaw:
+**Important production lesson (from USWW, 2026-05-15):** OpenClaw cron
+is great for jobs that need an LLM in the loop (drafting, briefings,
+multi-step decisions). For plain "run a Python script every N
+minutes" — like approval checkers and email pollers — use
+**systemd user timers** instead. The OpenClaw cron `agentTurn`
+runtime hard-codes `exec` security to allowlist mode, which generates
+a Telegram approval prompt for every script call. systemd avoids that
+entirely.
+
+**For this quickstart, the generator + approval-request job can be an
+OpenClaw cron** (it benefits from the agent loop). Tell OpenClaw:
 
 ```
-Add two cron jobs in America/New_York timezone, isolated sessions:
+Add one cron job in America/New_York timezone, isolated session:
 
-1. "Daily Forecast Generator" at 06:30 daily — runs:
-   cd ~/.openclaw/workspace/weather-agent && source .venv/bin/activate
-   && python scripts/daily_forecast.py && python scripts/request_daily_forecast_approval.py --latest
+"Daily Forecast Generator + Approval Request" at 06:30 daily — runs:
+  cd ~/.openclaw/workspace/weather-agent && source .venv/bin/activate
+  && python scripts/daily_forecast.py
+  && python scripts/request_daily_forecast_approval.py --latest
 
-2. "Daily Forecast Approval Checker" every 15 minutes — once you've
-   built the publisher (RUNBOOK_PROMPTS.md prompt 5), wire this to
-   check_daily_forecast_approval.py.
+Use payload toolsAllow: ["exec", "read"] to avoid approval-timeout
+stalls.
 
 Show me the cron list when done.
 ```
+
+**For the approval checker** (the every-15-min part), once you've
+built `check_daily_forecast_approval.py` per `RUNBOOK_PROMPTS.md`
+prompt 5, install it as a **systemd user timer** instead of a cron
+job. See `SETUP_GUIDE.md` § "Production patterns" → "systemd user
+timers for plain pollers" for the unit-file template.
 
 That's it. From here, work through `RUNBOOK_PROMPTS.md` to add the other bots one at a time.
 

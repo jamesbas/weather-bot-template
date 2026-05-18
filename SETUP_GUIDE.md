@@ -20,6 +20,7 @@ A step-by-step guide to standing up an OpenClaw environment that monitors offici
 10. [Build the agents (cron jobs)](#10-build-the-agents-cron-jobs)
 11. [Adapting this to your region](#11-adapting-this-to-your-region)
 12. [Operations, maintenance, and security](#12-operations-maintenance-and-security)
+13. [Production patterns (lessons from USWW)](#13-production-patterns-lessons-from-usww)
 
 ---
 
@@ -291,6 +292,19 @@ WX_TIMEZONE=America/New_York
 # Per-bot tunables
 MARINECAST_APPROVAL_EXPIRES_HOURS=6
 ALERT_EXPLAINER_DEDUP_TTL_HOURS=12
+
+# --- Optional: second publish target (your own website) ---
+# If set, approved content posts to your website in parallel with
+# Facebook via an HMAC-signed POST. See §13.4. Leave blank to skip.
+USWW_WEBSITE_BASE_URL=
+USWW_WEBSITE_API_KEY=
+USWW_WEBSITE_HMAC_SECRET=
+USWW_WEBSITE_DISABLED=             # set to 1 to kill-switch without code change
+
+# --- Optional: Event Weather Advisor (per-customer paid workflow) ---
+# Only needed if you build the Event Weather Advisor bot.
+EVENT_WEATHER_INTERNAL_RECIPIENTS=
+EVENT_WEATHER_DEFAULT_TIMEZONE=America/New_York
 ```
 
 ### 8.2 Source-data foundations
@@ -682,3 +696,321 @@ If you build something with this, please credit **US Weather Warriors** and link
 Stay safe out there. ⛈️
 
 — *JaimeClaw, US Weather Warriors*
+
+---
+
+## 13. Production patterns (lessons from USWW)
+
+The sections above get you to a working bot. These are the patterns
+we added in production after running USWW Delmarva for real — each
+one solves a specific failure mode we hit.
+
+### 13.1 Use systemd user timers for plain pollers (not OpenClaw cron)
+
+**The problem we hit (2026-05-15):** every OpenClaw cron `agentTurn`
+run hard-codes `tools.exec.security` to `allowlist` mode — even when
+your global config says `full`. That means every `python scripts/X.py`
+call inside an agentTurn cron generates an `/approve` request, which
+lands in Telegram. The 7 USWW approval-checker crons were generating
+~700 Telegram approval requests a day.
+
+**The fix:** approval checkers and email pollers are pure Python with
+no LLM in the loop. They don't need a cron `agentTurn` at all. Run
+them as **systemd user timers** instead. The python scripts execute
+directly, no agent runtime, no allowlist override, no Telegram spam.
+
+**When to use which:**
+
+| Job type | Scheduler | Why |
+|---|---|---|
+| Drafting a forecast post (LLM writes copy) | OpenClaw cron `agentTurn` | needs the agent loop |
+| Private forecaster briefing (LLM reasoning) | OpenClaw cron `agentTurn` | needs the agent loop |
+| Multi-step LLM decisions (chase target, severe-check + draft) | OpenClaw cron `agentTurn` | needs the agent loop |
+| Approval-reply checker (poll JSON + Gmail IMAP + maybe publish) | **systemd user timer** | pure Python, no LLM |
+| Email IMAP poller (sounding requests, etc.) | **systemd user timer** | pure Python, no LLM |
+| Mailbox cleanup (trash old approval emails) | **systemd user timer** | pure Python, no LLM |
+| Active-alert poller that drafts on hit | OpenClaw cron `agentTurn` | LLM-driven draft on match |
+
+**Unit-file template** — drop these under
+`~/.config/systemd/user/` and `daemon-reload && enable --now`:
+
+`weather-<bot>-approval-checker.service`:
+```ini
+[Unit]
+Description=Weather Bot — <bot> approval checker
+
+[Service]
+Type=oneshot
+ExecStart=/home/<you>/.openclaw/workspace/weather-agent/systemd/run-checker.sh check_<bot>_approval.py --send-notifications --verbose
+TimeoutStartSec=900
+Nice=10
+
+[Install]
+WantedBy=default.target
+```
+
+`weather-<bot>-approval-checker.timer`:
+```ini
+[Unit]
+Description=Run weather <bot> approval checker every 15 min
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=15min
+AccuracySec=30s
+Persistent=true
+Unit=weather-<bot>-approval-checker.service
+
+[Install]
+WantedBy=timers.target
+```
+
+`systemd/run-checker.sh`:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd /home/<you>/.openclaw/workspace/weather-agent
+source .venv/bin/activate
+exec python "scripts/$@" 2>&1 | tee -a "logs/${1%.py}.log"
+```
+
+**Enable linger** so timers run when you're logged out:
+```bash
+sudo loginctl enable-linger <you>
+systemctl --user daemon-reload
+systemctl --user enable --now weather-daily-forecast-approval-checker.timer
+systemctl --user list-timers 'weather-*'
+```
+
+### 13.2 `toolsAllow` on OpenClaw cron `agentTurn` payloads
+
+For the LLM-driven cron jobs that *do* belong in OpenClaw cron
+(generators, briefings, severe-weather checks), explicitly set
+`toolsAllow` on the payload to avoid the same approval-timeout stall
+at a smaller scale:
+
+```js
+{
+  payload: {
+    kind: "agentTurn",
+    message: "Run the daily forecast generator + approval request …",
+    toolsAllow: ["exec", "read"]
+    // add "write", "image" only if the specific job needs them
+  }
+}
+```
+
+Without this, the cron sub-agent inherits the allowlist default and
+stalls waiting for `/approve` on the first `python` call.
+
+### 13.3 LLM writer + deterministic safety-net fallback
+
+The naive way to write a forecast is "feed sources to LLM, take
+output, post." That breaks the moment the model returns garbage,
+times out, or the gateway has a hiccup. Production pattern:
+
+1. Keep your existing **deterministic generator** (Python rendering of
+   a Jinja-style template from the source data). This is the
+   *fallback*.
+2. Add a `src/weather/<bot>_writer.py` module:
+   - `build_prompt(source_bundle) -> str` — renders a structured
+     prompt anchored on the deterministic data.
+   - `write_post(source_bundle, fallback_callable) -> (text, llm_used, fallback_reason)`
+     — calls `openclaw capability model run --prompt <file> --gateway --json`
+     and returns the LLM text, falling back to the deterministic
+     output on subprocess error, timeout, non-OK envelope, or empty
+     `outputs[0].text`.
+3. Save per-run artifacts next to the normal output:
+   - `<bot>_llm_prompt.txt`
+   - `<bot>_llm_meta.json` — `{llm_used, fallback_reason, model, generated_at}`
+4. Add a `--no-llm` CLI flag on every bot to force deterministic mode
+   for diffing and testing.
+5. Add a smoke-test per bot covering: prompt-contents check, success
+   path, subprocess-error fallback, non-OK-envelope fallback.
+
+**Prompt design conventions** (apply to every public bot):
+
+- Numbered hard rules forbidding fabrication of CAPE / shear / lapse
+  rates / rainfall / dewpoints / frost dates / soil temps / hazard
+  categories.
+- No softening of NWS or SPC hazard wording.
+- SPC categorical wording (Marginal / Slight / Enhanced / Moderate /
+  High / PDS) reproduced **verbatim** from source data.
+- Per-bot allowed-emoji list (usually one header emoji only) and a
+  per-bot hashtag whitelist.
+- Target word count.
+- Standard public closer: "<brand> is sharing official weather
+  information for awareness. Follow NWS warnings and local emergency
+  guidance."
+- Public bots: brand sign-off above hashtags.
+- Private bots (forecaster briefing): no emojis, no hashtags, no
+  sign-off; technical shorthand allowed; explicit rule to say
+  "unavailable from current source data" rather than invent values.
+
+The writers should **not pin a model** by default — omit `--model` and
+let the gateway default pick. A specific model can be set per-bot via
+the writer dataclass `model` field if you need to pin one (e.g. send
+the forecaster briefing to a larger model than the daily post).
+
+### 13.4 Approval-request idempotency guard
+
+**The problem we hit (2026-05-17):** a cron sub-agent
+second-guessed a path and ran `python scripts/marinecast.py
+--request-approval` **three times** in one cron fire. Result: 3
+approval IDs + 3 Telegram + 3 emails for the same forecast date.
+
+**The fix:** every `--request-approval` code path checks for an
+existing non-dry-run, non-expired pending approval for the same
+`forecast_date` **before** calling `create_approval(...)`. If one
+exists, print `REUSED_EXISTING_APPROVAL_ID=<id>` and exit 0 without
+creating a duplicate or re-sending notifications.
+
+Minimal helper module — `src/weather/approval_idempotency.py`:
+```python
+from datetime import datetime, timezone
+
+def find_existing_pending_approval(store, forecast_date, dry_run=False):
+    """Return the most recent pending, non-expired, non-dry-run approval
+    for forecast_date, or None."""
+    now = datetime.now(timezone.utc).timestamp()
+    candidates = [
+        a for a in store.pending()
+        if a.get("forecast_date") == forecast_date
+        and a.get("status") == "pending"
+        and not a.get("dry_run", False)
+        and float(a.get("expires_ts", 0)) > now
+    ]
+    candidates.sort(key=lambda a: a.get("created_ts", 0), reverse=True)
+    return candidates[0] if candidates else None
+```
+
+Wire it into every `request_*_approval.py` and into `marinecast.py
+--request-approval` and the equivalent inline-request paths.
+
+### 13.5 Same-day publish-path dedup gotcha
+
+If a deterministic run posts using `final_post.md` and then you
+re-run the LLM writer the same day, the publisher's `mark_post_attempt`
+dedup guard will block the second post because the path matches.
+
+**Workaround:** always save LLM-writer output to a sibling file with
+an `_llm.md` suffix so a same-day re-post never collides. Update the
+approval's stored file reference to point at the `_llm.md` file before
+calling the publisher.
+
+Better: from day one, write LLM output to `<basename>_llm.md` and
+deterministic fallback output to `<basename>.md` so the paths are
+always distinct.
+
+### 13.6 Second publish target: your own website (parallel to Facebook)
+
+USWW added a second publish target on 2026-05-16: an HMAC-signed POST
+to the USWW website that mirrors approved Facebook content. The
+pattern is general enough to drop into this template.
+
+**Design rules:**
+
+- Website publish runs **after** the Facebook publish, inside a
+  try/except that must **not** block Facebook on failure. Facebook is
+  the authoritative "post happened" signal.
+- HMAC-SHA256 over `timestamp + "." + rawBody`, sent as
+  `X-USWW-Api-Key`, `X-USWW-Timestamp`,
+  `X-USWW-Signature: sha256=<hex>` headers.
+- Local idempotency: skip if the approval record's
+  `website_status == "posted"`. Server idempotency: dedupe on
+  `approvalId` as a backstop.
+- Kill switch via `WEBSITE_DISABLED=1` env var (don't require a code
+  change to pause the integration).
+
+**Files to add:**
+
+- `src/weather/website_client.py` exposing `WebsiteClient`,
+  `excerpt_from_markdown`, `record_website_result`,
+  `already_posted_to_website`.
+- `scripts/publish_to_website_<bot>.py` per in-scope bot.
+- Wire each `scripts/publish_to_website_<bot>.py` into the matching
+  approval checker right after the Facebook publish call.
+
+**Approval-record fields after a website attempt:**
+`website_status` (`posted`/`post_failed`/`disabled`), `website_post_id`,
+`website_public_url`, `website_published_at`, `website_error`,
+`website_status_code`.
+
+**Scope discipline:** public bots only. Private bots (forecaster
+briefing, chase target advisor, sounding analyst, GrowCast private
+weekly briefing, Event Weather Advisor) must NOT post to the website.
+
+### 13.7 Per-customer paid workflow: Event Weather Advisor
+
+A different shape of bot worth knowing about: per-event weather
+advisories for paying customers (outdoor weddings, concerts,
+festivals, sports). Not on a cron — operator-driven, scaffolded via:
+
+1. `event_weather_intake.py` — register a customer event
+   (datetime, lat/lon, venue, customer contact).
+2. `event_weather_prepare_update.py` — deterministic Python: pulls
+   NWS active alerts + forecast for the event point, AFD context, SPC
+   categorical (when ≤ 3 days out), WPC excessive rainfall,
+   climatology (NOAA normals + 30-yr historical analog + CPC
+   outlooks) for far-out events. Computes a deterministic risk
+   summary (Overall + Rain / Thunderstorm / Severe / Wind / Heat /
+   Cold / Flooding / Setup-Teardown). Outputs a structured LLM
+   prompt packet.
+3. LLM stage — the operator (or a script) hands the prompt packet to
+   the OpenClaw gateway default LLM, which produces a dual-output
+   document with `<<<CUSTOMER_UPDATE_BELOW>>>` as a literal marker
+   between the internal review and the customer-facing email.
+4. `event_weather_send_email.py --send-internal` / `--send-customer`
+   — explicit operator-gated send. Never automatic.
+5. `event_weather_due_updates.py` — candidate runner if/when you
+   want a recurring "is anything due for a refresh?" check.
+
+**Hard rules** (encode in the LLM prompt):
+
+- Never recommend cancellation / postponement unless overall risk is
+  `High` **or** an active severe/flood warning is in the source
+  bundle.
+- Never fabricate forecast values — say "unavailable from current
+  source data."
+- Never present climatology as a forecast. Use "historically," "on
+  average," "the CPC outlook leans toward."
+- `data_strategy == climate_only` (event beyond NWS forecast window)
+  must state that plainly; confidence stays Low.
+- Customer email always closes with a line directing the customer to
+  monitor official NWS warnings independently + your brand sign-off.
+- **Never** publishes to Facebook or the website.
+
+### 13.8 Mailbox cleanup
+
+USWW outbound approval-request / result emails accumulate in Sent and
+replies pile up in Inbox. A small `scripts/cleanup_mailbox.py`
+(systemd timer, daily at 18:00 local) trashes outbound USWW approval/
+result emails > 3 days old and approval replies whose approval has
+reached a terminal status. Nothing fancy — just keeps the mailbox
+manageable.
+
+### 13.9 Heartbeat sanity
+
+If you wire heartbeat checks for the main session, batch them in a
+shared `HEARTBEAT.md` checklist (calendar + email + alerts in one
+turn) rather than spawning one cron per check. Reserve cron for jobs
+that need exact timing or isolated context.
+
+### 13.10 Sounding analyst: read-gated pattern
+
+The Sounding Email Analyst is the one cron that legitimately needs
+both an IMAP poll *and* an LLM image-analysis step. Split it in two:
+
+- A **systemd timer** runs `poll_sounding_email_requests.py` every 10
+  min and writes a small `state/sounding_pending.json` (count of
+  unprocessed requests + their paths).
+- An **OpenClaw cron** `agentTurn` runs every 15 min and immediately
+  reads `state/sounding_pending.json`. If `count == 0`, the agent
+  replies `STILL_NOTHING_TO_DO` and exits early without burning
+  tokens. Otherwise it processes the pending images with the `image`
+  tool and replies via `scripts/send_sounding_email_response.py`.
+
+This read-gated pattern keeps LLM token burn near zero on quiet days
+while retaining LLM analysis on busy days.
+
+---
