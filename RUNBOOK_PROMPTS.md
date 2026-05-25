@@ -127,7 +127,7 @@ Create an OpenClaw hook at
 ~/.openclaw/workspace/hooks/weather-approval-router/ with HOOK.md and
 handler.js. The handler should match Telegram messages of exact form
 "APPROVE <id>" or "REJECT <id>" where the id starts with one of these
-prefixes: dfa_, sva_, mca_, gca_, sra_, aea_, asa_.
+prefixes: dfa_, sva_, mca_, gca_, sra_, aea_, asa_, twa_, ewa_.
 
 When matched, run scripts/handle_routed_telegram_approval.py inside
 the weather-agent venv with --text, --sender-id, --chat-id, and verify
@@ -573,6 +573,194 @@ event_weather_due_updates.py as a systemd timer that just logs
 
 ---
 
+## Prompt 16.5 — (Optional) Tropical Watch Bot
+
+Skip this prompt if your region is landlocked or otherwise won't see tropical impacts.
+
+```
+Build the Tropical Watch Bot per SETUP_GUIDE.md §10.10. It is a
+pure-Python NHC monitor (no LLM in the monitor loop — LLM only enters
+at approval-message render time).
+
+Create under weather-agent/:
+
+1. src/weather/tropical_bot.py — TropicalWatchBot.run(dry_run,
+   force_notify, update_state) that:
+   - Pulls NHC Tropical Weather Outlooks (Atlantic + East Pacific).
+   - Pulls active-storm advisories.
+   - Filters for region relevance (forecast cone intersects our
+     region polygon, TWO highlights a system threatening our coast).
+   - Dedups against state/tropical_seen.json by
+     system_id + advisory_number.
+   - Returns a result object with should_notify,
+     new_systems_count, active_storms_count,
+     skipped_duplicate_count.
+
+2. scripts/tropical_watch.py [--dry-run] [--send-telegram]
+   [--force-notify] [--verbose] — thin CLI wrapping the bot;
+   sends Telegram only when new tropical systems are found.
+
+3. scripts/request_tropical_approval.py [--latest --verbose] —
+   reads the latest tropical update, registers a twa_ approval,
+   sends Telegram + email.
+
+4. scripts/check_tropical_approval.py [--send-notifications --verbose]
+
+5. scripts/publish_approved_tropical_update.py --approval-id <id>
+
+Cron / timer split:
+- **systemd timer** with three OnCalendar entries at 08:00 / 14:00 /
+  20:00 local: `weather-tropical-watch-monitor.timer` runs a wrapper
+  shell script that invokes `tropical_watch.py --send-telegram
+  --verbose` then immediately
+  `request_tropical_approval.py --latest --verbose`.
+- **systemd timer**: `weather-tropical-approval-checker.timer`
+  every 15 min.
+
+Hard rules in the LLM approval-message render:
+- Reproduce NHC categorical / formation-chance numbers verbatim.
+- Never use the words "catastrophic", "unprecedented", "life-
+  threatening" unless they appear verbatim in NHC text.
+- Always include the system's name (or invest #), advisory number,
+  and the NHC product timestamp.
+```
+
+---
+
+## Prompt 16.6 — (Optional) HREF × SPC × HRRR Synthesis (private internal briefing)
+
+Skip this if you don't want a model-comparison briefing.
+
+```
+Build the HREF × SPC × HRRR Synthesis internal briefing per
+SETUP_GUIDE.md §10.11. PRIVATE — never publishes publicly.
+
+Create under weather-agent/:
+
+1. src/weather/href_client.py — NOMADS HREF GRIB idx byte-range
+   fetcher. Probabilistic fields (UH 2-5km / UH 0-3km / REFC ≥40)
+   and ensemble means (MLCAPE / shear / SRH).
+
+2. src/weather/hrrr_client.py — mirrors href_client shape; pulls
+   the matching HRRR deterministic fields for cross-check. Uses
+   pygrib (not cfgrib). Documents in a docstring that 0–6 km shear
+   is approximated by a 10 m vs 500 mb proxy because NOMADS HRRR
+   does not publish a true VWSH:0-6000m AGL field.
+
+3. src/weather/href_severe_extractor.py — build_severe_summary(...)
+   returning a 0–4 risk ladder. Tightened thresholds:
+   organized-hour gate requires both prob_refc_gt40 ≥ 60% AND
+   per-hour MLCAPE ≥ 1000 J/kg; REFC level table capped by peak
+   CAPE/shear/SRH; UH75 is primary; REFC may add at most +1 level
+   on top, env-permitting. Expose HREF_THRESHOLDS as a single dict
+   for retuning.
+
+4. src/weather/hrrr_severe_extractor.py — deterministic 0–4 ladder
+   on peak UH 2-5km, REFC, MLCAPE, shear.
+
+5. src/weather/hrrr_href_crosscheck.py — HrrrHrefCrossCheck with
+   four verdicts: corroborates / not corroborating (downgrade) /
+   hotter than HREF / unavailable.
+
+6. src/weather/href_spc_synthesis.py — ties HREF + SPC + HRRR
+   into a synthesis object. HRRR is optional; fetch failures must
+   NOT block synthesis.
+
+7. src/weather/href_synthesis_writer.py — prompt + deterministic
+   fallback. Both must render an `## At-a-glance` card (5 bullets:
+   SPC Day 1 / HREF Day 1 + agreement / HRRR cross-check / peak
+   window + storm mode / cycle confidence).
+
+8. scripts/href_vs_spc_synthesis.py [--cycle CC] [--date YYYY-MM-DD]
+   [--no-llm] [--force-deliver] [--dry-run]
+   [--no-hrrr-crosscheck] [--verbose] [--output-dir DIR] — main
+   entrypoint. HTML email body wraps the at-a-glance section in a
+   styled card (slate background, blue accent rail, color-coded
+   verdict badges — green for corroborates, amber for
+   slightly-hot, red for overshoots / not corroborating, gray for
+   unavailable). Short Telegram summary mirrors the same shape.
+
+9. tests/ for href_client, hrrr_client, href_severe_extractor,
+   hrrr_crosscheck, href_synthesis_writer.
+
+Cron / timer split:
+- **systemd timer** with OnCalendar 09:30 / 14:30 / 17:30 local —
+  three separate timers (`weather-href-synthesis-morning.timer`,
+  `-midday.timer`, `-evening.timer`).
+- No approval workflow — private internal briefing.
+
+Hard rules in the LLM prompt:
+- HREF level is primary; HRRR cross-check changes the verdict
+  wording but not the level.
+- Never soften SPC categorical wording.
+- HRRR cross-check section must note when the 0–6 km shear proxy
+  is in use.
+- Tolerate missing HRRR fields by labeling them "unavailable" in
+  the cross-check section.
+```
+
+---
+
+## Prompt 16.7 — (Optional) Switch MarineCast + public GrowCast to auto-publish + FYI
+
+Only run this after the approval-gated flow has produced clean drafts for months and you genuinely never edit them. See SETUP_GUIDE.md §13.11.
+
+```
+Add the "auto-publish + FYI" mode for MarineCast and the PUBLIC daily
+GrowCast (the private weekly grower briefing must NOT change).
+
+Create under weather-agent/scripts/:
+
+1. auto_publish_marinecast.py [--dry-run] [--skip-fyi] [--verbose]
+   — builds the daily MarineCast, sends Telegram + email FYI
+   prefixed with `ℹ️ … FYI — auto-publishing … edit the live
+   post directly if you want to tweak it`, synthesizes an
+   auto-approved approval record, then calls the same
+   publish_approval(...) + record_website_result(...) helpers the
+   human-approval path uses (so the existing content-ledger /
+   mark_post_attempt dedup guard keeps re-runs safe).
+
+2. auto_publish_growcast.py with the same shape, gated to public
+   daily only — must NOT touch the private weekly grower
+   briefing.
+
+Cron / timer changes:
+- Repoint the MarineCast cron from `marinecast.py --daily
+  --request-approval` to `auto_publish_marinecast.py --verbose`.
+- Repoint the public GrowCast cron similarly to
+  `auto_publish_growcast.py --verbose`.
+- Disable the public-GrowCast approval-request cron.
+- LEAVE the systemd approval-checker timers enabled — they become
+  no-op safety nets.
+
+Do NOT switch Daily Forecast, Severe Weather, Storm Reports, Alert
+Explainer, or Tropical Watch to this mode — those stay
+approval-gated.
+
+Verify with: `.venv/bin/python scripts/auto_publish_marinecast.py
+--dry-run --skip-fyi --verbose` and the GrowCast equivalent. Both
+must exit clean with no Facebook / website POSTs.
+```
+
+---
+
+## Prompt 16.8 — (Optional) Daily mailbox cleanup
+
+```
+Create scripts/cleanup_mailbox.py and install
+`weather-mailbox-cleanup.timer` (OnCalendar daily at 18:00 local) to
+run `cleanup_mailbox.py --apply --verbose`.
+
+The cleanup should:
+- Trash outbound approval-request / result emails older than 3 days.
+- Trash approval replies whose approval has reached a terminal
+  status (approved / rejected / expired).
+
+Use --dry-run for a no-op trial run. Add a smoke test under tests/.
+```
+
+---
+
 ## Prompt 17 — Final wiring and verification
 
 ```
@@ -583,19 +771,27 @@ Now do a full audit of what we built. Show me:
 2. The full OpenClaw cron list with names, schedules, and timezones.
    Confirm: every approval-checker is a systemd timer, NOT an OpenClaw
    cron. Every OpenClaw cron agentTurn payload has an explicit
-   toolsAllow list.
+   toolsAllow list (the Sounding Email Analyst payload must include
+   `image` in toolsAllow).
 3. `systemctl --user list-timers 'weather-*'` showing every approval
-   checker + email poller as a systemd timer.
+   checker + email poller + (if built) tropical watch monitor + HREF
+   synthesis timers + mailbox cleanup as a systemd timer.
 4. The contents of ~/.openclaw/workspace/weather-agent/.env.example
 5. A tree of weather-agent/ to depth 2.
-6. A summary of every approval-ID prefix in use and which bot owns it.
+6. A summary of every approval-ID prefix in use and which bot owns it
+   (dfa_, sva_, mca_, gca_, sra_, aea_, twa_, ewa_, asa_).
 7. For each public bot: confirm <bot>_writer.py exists, a smoke test
    exists, and approval_idempotency.py is called from the matching
    request_*_approval.py.
 8. If website publishing is wired: confirm publish_to_website_<bot>.py
    exists ONLY for in-scope bots (daily_forecast, marinecast, growcast
-   public, severe_weather, alert_explainer) and NOT for the
-   out-of-scope ones.
+   public, severe_weather, alert_explainer, tropical_watch) and NOT
+   for the out-of-scope ones.
+9. If MarineCast and/or public GrowCast are in auto-publish + FYI
+   mode, confirm: the matching OpenClaw cron points at
+   auto_publish_<bot>.py, the request-approval cron is disabled, the
+   systemd approval-checker timer is still enabled as a safety net,
+   and a dry-run of the auto-publish script exits clean.
 
 Then propose three things you would tighten or improve before going
 to production. Wait for my go-ahead before changing anything.
@@ -642,23 +838,28 @@ and ~/.openclaw/logs/. Tell me what happened.
 
 ## What good looks like
 
-After all 18 prompts, you should have:
+After all prompts, you should have:
 
-- ✅ ~6–8 OpenClaw cron jobs (LLM-driven generators + private briefings
-  only), each with an explicit `toolsAllow` list on its agentTurn
-  payload
-- ✅ ~7–9 systemd user timers (approval checkers, email pollers,
-  mailbox cleanup), enabled with linger so they survive logout
-- ✅ One approval router hook handling 7+ ID prefixes (`dfa_`, `sva_`,
-  `mca_`, `gca_`, `sra_`, `aea_`, `asa_`, `ewa_` if you built the
-  Event Weather Advisor)
-- ✅ A `weather-agent/` Python project with one venv, ~30–40 scripts,
+- ✅ ~6–9 OpenClaw cron jobs (LLM-driven generators + private briefings
+  only, plus the read-gated sounding analyst), each with an explicit
+  `toolsAllow` list on its agentTurn payload
+- ✅ ~10–14 systemd user timers (approval checkers, email pollers,
+  tropical watch monitor, HREF synthesis morning/midday/evening,
+  event-weather intake, mailbox cleanup, sounding poller), enabled
+  with linger so they survive logout
+- ✅ One approval router hook handling 8–9 ID prefixes (`dfa_`,
+  `sva_`, `mca_`, `gca_`, `sra_`, `aea_`, `twa_`, `asa_`, `ewa_` if
+  you built the Event Weather Advisor)
+- ✅ A `weather-agent/` Python project with one venv, ~40–60 scripts,
   per-bot `<bot>_writer.py` modules with deterministic fallbacks, a
-  shared `approval_idempotency.py` guard, and a clean tests/ directory
+  shared `approval_idempotency.py` guard, an HREF × SPC × HRRR
+  synthesis stack if you built it, and a clean tests/ directory
 - ✅ Telegram + email + (optional) Facebook + (optional) website all
   wired
-- ✅ Nothing posts publicly without an `APPROVE <id>` from your
-  verified Telegram ID
+- ✅ Trusted public bots (MarineCast + public GrowCast) optionally on
+  auto-publish + FYI; everything warning-grade still approval-gated
+- ✅ Nothing warning-grade posts publicly without an `APPROVE <id>`
+  from your verified Telegram ID
 
 If something's missing or broken, **ask OpenClaw to fix it
 conversationally** — that's the whole point of building it this way.

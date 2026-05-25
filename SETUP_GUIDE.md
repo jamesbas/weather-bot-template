@@ -21,6 +21,7 @@ A step-by-step guide to standing up an OpenClaw environment that monitors offici
 11. [Adapting this to your region](#11-adapting-this-to-your-region)
 12. [Operations, maintenance, and security](#12-operations-maintenance-and-security)
 13. [Production patterns (lessons from USWW)](#13-production-patterns-lessons-from-usww)
+14. [Approval ID prefixes in use](#14-approval-id-prefixes-in-use)
 
 ---
 
@@ -537,10 +538,22 @@ Filters LSRs by county FIPS or polygon, groups by event type (tornado, hail, win
 
 **Purpose:** Daily marine forecast for boaters and coastal residents.
 
+Two deployment modes:
+
+**Approval-gated mode** (default):
+
 | Job | Schedule | Script |
 |---|---|---|
 | Daily draft + approval request | `0 5 * * *` | `python scripts/marinecast.py --daily --request-approval` |
 | Approval checker | every 15 min | `python scripts/check_marinecast_approval.py --send-notifications` |
+
+**Auto-publish + FYI mode** (see §13.11) — drop the approval step entirely once you trust the bot, and let it post to Facebook + your website immediately while still mailing a Telegram + email FYI copy:
+
+| Job | Schedule | Script |
+|---|---|---|
+| Daily auto-publish | `0 5 * * *` | `python scripts/auto_publish_marinecast.py --verbose` |
+
+The approval-checker timer can be left enabled as a no-op safety net.
 
 Skip this bot entirely if you cover an inland region.
 
@@ -550,14 +563,17 @@ Skip this bot entirely if you cover an inland region.
 
 **Purpose:** Seasonal (April–October) gardening / lawn / small-farm guidance based on weather.
 
+Like MarineCast, the **public daily** half can run in approval-gated mode or in auto-publish + FYI mode (see §13.11). The **private weekly grower briefing** is always email-only and never posts publicly.
+
 | Job | Schedule | Script |
 |---|---|---|
-| Daily public draft | `0 7 * 4-10 *` | `python scripts/growcast.py --daily --public` |
-| Daily approval request | `15 7 * * *` | `python scripts/request_growcast_approval.py --latest` |
-| Weekly private briefing | `0 8 * * 0` | `python scripts/growcast.py --weekly --private --send-email` |
-| Approval checker | every 15 min | `python scripts/check_growcast_approval.py --send-notifications` |
+| Daily public draft (approval-gated) | `0 7 * 4-10 *` | `python scripts/growcast.py --daily --public` |
+| Daily approval request (approval-gated) | `15 7 * * *` | `python scripts/request_growcast_approval.py --latest` |
+| **OR** Daily auto-publish + FYI | `0 7 * 4-10 *` | `python scripts/auto_publish_growcast.py --verbose` |
+| Weekly private grower briefing (always email-only) | `0 8 * * 0` | `python scripts/growcast.py --weekly --private --send-email` |
+| Approval checker (only needed in approval-gated mode) | every 15 min | `python scripts/check_growcast_approval.py --send-notifications` |
 
-The `* 4-10 *` portion of the cron expression limits this to April through October.
+The `* 4-10 *` portion of the cron expression limits the daily public job to April through October.
 
 ---
 
@@ -590,15 +606,67 @@ The cron prompt should explicitly say: *"Only send anything if `chase_target_rec
 
 **Purpose:** Authorized teammates email a Skew-T / hodograph image to the bot's Gmail; the bot replies with a structured severe-weather analysis of the sounding.
 
-| Job | Schedule | Script |
-|---|---|---|
-| IMAP watcher | every 10 min | `python scripts/poll_sounding_email_requests.py` |
+**Production pattern:** hybrid systemd + OpenClaw cron (read-gated). See §13.10.
 
-The cron *prompt* (not the script) instructs the agent: read each new image with the `image` tool, perform the model-sounding analysis, then run `scripts/send_sounding_email_response.py` to reply by email. Restrict allowed senders inside the script — never trust the LLM to enforce that.
+| Job | Scheduler | Script |
+|---|---|---|
+| IMAP poller (writes `state/sounding_pending.json`) | **systemd timer**, every 10–15 min | `poll_sounding_email_requests.py` |
+| Read-gated analyst (reads pending file, exits cheap on `count==0`) | **OpenClaw cron `agentTurn`**, every 15 min | inline prompt + `image` tool + `send_sounding_email_response.py` |
+
+The trigger rule is **subject-only**: the subject MUST contain the phrase "analyze this sounding" (case-insensitive, `analyse` also accepted). Replies / forwards (`Re:`, `Fwd:`) are rejected even if they carry the phrase. Body text is **never** a trigger — broadening this regex once caused a forecast-approval-reply to falsely trigger a sounding analysis.
+
+Restrict allowed senders inside the script via `SOUNDING_EMAIL_ALLOWED_SENDERS` — never trust the LLM to enforce that.
 
 ---
 
-### 10.10 Recap of recommended schedule cadence
+### 10.10 Tropical Watch Bot 🌀
+
+**Purpose:** Monitor the National Hurricane Center for active tropical systems and Tropical Weather Outlooks (TWOs), filter for relevance to your region, and request approval to publish a Tropical Watch update to Facebook + your website. Pure Python monitor; LLM only enters at approval time.
+
+| Job | Scheduler | Script |
+|---|---|---|
+| TWO + active-storm monitor (3× daily) | **systemd timer**, OnCalendar 08:00 / 14:00 / 20:00 local | wrapper that runs `tropical_watch.py --send-telegram --verbose` then `request_tropical_approval.py --latest --verbose` |
+| Approval checker | **systemd timer**, every 15 min | `check_tropical_approval.py --send-notifications --verbose` |
+
+Monitor logic:
+- Pulls NHC TWO (Atlantic + East Pacific) + active-storm advisories.
+- Filters for region relevance (forecast cone intersects your area, TWO highlights a system threatening your coast, etc.).
+- Dedup state lives in `state/tropical_seen.json` — each system + advisory number is processed once.
+- On a meaningful new system / forecast change it auto-runs the approval-request script, which sends Telegram + email and registers a `twa_` approval ID.
+
+**Out of scope** for this bot: daily marine forecasts (that's MarineCast), storm reports (Storm Reports Bot), tropical climatology summaries.
+
+---
+
+### 10.11 HREF × SPC × HRRR Synthesis 🧠 (private internal briefing)
+
+**Purpose:** Compare the HREF ensemble (NOAA's high-resolution ensemble) against SPC's categorical outlooks for your region 3 times a day, with an HRRR deterministic cross-check, and email a private internal severe-weather briefing. **Never** posts publicly.
+
+| Job | Scheduler | Cycle anchor |
+|---|---|---|
+| Morning synthesis | **systemd timer**, OnCalendar 09:30 local | 13Z HREF |
+| Midday synthesis | **systemd timer**, OnCalendar 14:30 local | 18Z HREF |
+| Evening synthesis | **systemd timer**, OnCalendar 17:30 local | 18Z HREF |
+
+What the script does (`href_vs_spc_synthesis.py`):
+
+1. Pulls SPC Day 1 categorical + MDs intersecting your region polygon.
+2. Pulls HREF GRIB fields (UH 2–5 km / UH 0–3 km probabilities, REFC ≥40, mean MLCAPE / shear / SRH) via NOMADS idx byte-range fetches.
+3. Pulls a parallel HRRR deterministic severe summary as an independent cross-check (peak UH, REFC, MLCAPE, shear).
+4. Synthesizes a 0–4 risk ladder for HREF that is environment-capped (REFC pathway requires real CAPE/shear/SRH so a moist trash day doesn't get called ENH).
+5. Renders an at-a-glance card + full briefing; routes long-form to email and a short summary to Telegram with verdict cues (🔴🟡🟢⚪).
+6. Tolerates edge-of-cycle 404s (a missing forecast hour marks the field unavailable rather than failing the whole run).
+
+**Hard rules in the LLM prompt:**
+- HREF level is primary; HRRR cross-check can change verdict wording but not the level.
+- Never soften SPC categorical wording.
+- HRRR cross-check explicitly notes when the deep-layer shear proxy is in use (NOMADS HRRR doesn't publish a true 0–6 km VWSH field, so a 10 m vs 500 mb proxy is documented as a defensible stand-in).
+
+If you only have one local NWS office and limited compute, you can skip this bot or run it once daily.
+
+---
+
+### 10.12 Recap of recommended schedule cadence
 
 - **Generators / drafters** — once or twice daily at the right time.
 - **Approval checkers** — every **15 minutes**. Never set a checker to every 5 minutes; you'll burn LLM tokens for almost no benefit.
@@ -1011,6 +1079,99 @@ both an IMAP poll *and* an LLM image-analysis step. Split it in two:
   tool and replies via `scripts/send_sounding_email_response.py`.
 
 This read-gated pattern keeps LLM token burn near zero on quiet days
-while retaining LLM analysis on busy days.
+while retaining LLM analysis on busy days. The cron payload's
+`toolsAllow` list must include `"image"` for this to work.
+
+### 13.11 Auto-publish + FYI: skipping approval for trusted public bots
+
+**The lesson (USWW, 2026-05-25):** after months of MarineCast and the
+public GrowCast clearing approval with zero edits 95% of the time, the
+approval step was pure overhead. We switched both to an
+**"auto-publish + FYI"** pattern: the bot drafts, immediately
+publishes to Facebook + the website, and still mails a Telegram +
+email FYI copy so the operator can edit the **live post** afterward
+if anything needs tweaking.
+
+This is **only** appropriate for bots where:
+
+- The deterministic generator has months of human-edit baseline
+  showing the auto-output is publishable as-is.
+- The content is informational, not warning-grade (no severe / no
+  tornado / no tropical content goes through this mode).
+- A live edit on Facebook + your website is acceptable as the
+  correction mechanism.
+
+Keep these bots **approval-gated** even if you trust them: Daily
+Forecast, Severe Weather, Storm Reports, Alert Explainer, Tropical
+Watch.
+
+**Implementation pattern** (`scripts/auto_publish_<bot>.py`):
+
+1. Build the draft via the existing generator.
+2. Send a Telegram + email **FYI** prefixed with something like
+   `ℹ️ — auto-publishing — edit the live post directly if you want
+   to tweak it.`
+3. Synthesize an auto-approved approval record so the existing
+   approval-store ledger and `mark_post_attempt` dedup guard still
+   protect against double-posting on re-runs.
+4. Call the same `publish_approval(...)` / `record_website_result(...)`
+   helpers the human-approval path uses.
+5. Leave the matching systemd approval-checker timer enabled — it
+   becomes a no-op safety net (no pending approvals to find).
+
+Dry-run flag is mandatory: `--dry-run --skip-fyi --verbose` must build
+everything and post nothing, for sanity checks.
+
+### 13.12 Bot-specific lessons worth keeping
+
+- **Sounding Analyst trigger regex — subject-only.** Body-text
+  triggers cause false positives. Locked subject regex requires the
+  phrase "analyze this sounding" (or `analyse`), rejects `Re:` /
+  `Fwd:` prefixes.
+- **Chase Target dedup gate.** `scripts/chase_target_advisor.py`
+  carries a `state/chase_target_last_sent.json` dedup guard. Hourly
+  cron suppresses sends when nothing material has changed AND less
+  than `--min-resend-hours` (default 3) have elapsed. Don't add
+  `--force-send` to the cron payload; let the gate work.
+- **HREF env-cap on REFC pathway.** Without it the REFC organized-
+  hours counter racks up trivial hours on any moist day and falsely
+  calls Enhanced risk. Tighten organized-hour gate to require both
+  `prob_refc_gt40 ≥ 60%` AND per-hour MLCAPE ≥ 1000 J/kg, and cap
+  the REFC pathway by peak CAPE/shear/SRH.
+- **HRRR cross-check, never a blocker.** The HRRR fetch is optional;
+  edge-of-cycle 404s on `wrfprsf<HR>.grib2.idx` should leave the
+  field marked unavailable and let synthesis still build.
+- **Tropical Watch dedup.** Track each system advisory number in
+  `state/tropical_seen.json` so a 5-minute advisory refresh from NHC
+  doesn't re-trigger.
+- **Event Weather email intake on a systemd timer.** A separate
+  `event_weather_email_intake.py --apply` poller runs twice daily
+  (10:00 + 22:00 local) to ingest customer event requests from Gmail
+  into the `EventWeatherStore`. The advisor itself stays
+  operator-driven; only intake is on a timer.
+
+---
+
+## 14. Approval ID prefixes in use
+
+Keep prefixes short, memorable, and unique — they end up in every
+Telegram approval message a teammate types. USWW uses:
+
+| Prefix | Bot | Channel(s) |
+|---|---|---|
+| `dfa_` | Daily Forecast | Telegram + email |
+| `sva_` | Severe Weather update | Telegram + email |
+| `mca_` | MarineCast (approval-gated mode) | Telegram + email |
+| `gca_` | GrowCast public (approval-gated mode) | Telegram + email |
+| `sra_` | Storm Reports | Telegram + email |
+| `aea_` | Alert Explainer | Telegram + email |
+| `twa_` | Tropical Watch update | Telegram + email |
+| `asa_` | Sounding Email Analyst routing (handler-internal) | n/a |
+| `ewa_` | Event Weather Advisor (per-customer) | operator-driven |
+
+The approval router hook regex must include every prefix you ship.
+When adding a new bot, update the regex in `handler.js` **and** the
+handler script's dispatch table in the same change — mismatches are
+the most common source of "approval reply did nothing" tickets.
 
 ---
